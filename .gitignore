@@ -17,3 +17,4 @@ data/*.sqlite3
 # editor
 .vscode/
 .idea/
+data/sounding.db
