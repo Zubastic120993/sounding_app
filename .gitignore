@@ -18,3 +18,4 @@ data/*.sqlite3
 .vscode/
 .idea/
 data/sounding.db
+data/ops.db
