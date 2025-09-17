@@ -149,6 +149,39 @@ def add_reading(conn: sqlite3.Connection,
              vcf, volume_15c_m3, mass_kg, note)
         )
 
+
+def close_session(conn: sqlite3.Connection, session_id: int, ended_at: str | None = None, note: str | None = None):
+    """
+    Mark a session as ended. If ended_at is None, use current timestamp.
+    If note is provided, append it to the session note (with a newline if needed).
+    """
+    # End timestamp
+    if ended_at is None:
+        conn.execute(
+            "UPDATE sessions SET closed_at = CURRENT_TIMESTAMP WHERE id = ?;",
+            (session_id,)
+        )
+    else:
+        conn.execute(
+            "UPDATE sessions SET closed_at = ? WHERE id = ?;",
+            (ended_at, session_id)
+        )
+
+    # Optional note append
+    if note:
+        row = conn.execute(
+            "SELECT note FROM sessions WHERE id = ?;",
+            (session_id,)
+        ).fetchone()
+        prev = row[0] if row and row[0] else ""
+        new_note = (prev + ("\n" if prev else "") + note)
+        conn.execute(
+            "UPDATE sessions SET note = ? WHERE id = ?;",
+            (new_note, session_id)
+        )
+
+    conn.commit()
+
 if __name__ == "__main__":
     # Create/ensure schema and show where the DB is.
     conn = connect()
