@@ -19,3 +19,19 @@ data/*.sqlite3
 .idea/
 data/sounding.db
 data/ops.db
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local data
+data/*.db
+data/*.db.bak
+*.bak
