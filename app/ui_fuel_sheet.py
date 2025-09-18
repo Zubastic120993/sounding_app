@@ -80,6 +80,7 @@ class FuelTable(QTableWidget):
     COLS = [
         "Tk", "Description", "100% Full (m³)", "At Fill % (m³)",
         "Mode", "Level (cm)", "Temp (°C)", "Density@15 (kg/m³)",
+        "Observed Vol (m³)",   # NEW
         "VCF", "Vol@15 (m³)", "Mass (t)", "Calc"
     ]
 
@@ -159,22 +160,26 @@ class FuelTable(QTableWidget):
         de.setStyleSheet(GREEN)
         self.setCellWidget(r, 7, de); widgets["dens15"] = de
 
+        # Observed Vol (m³) – computed
+        it_vobs = QTableWidgetItem("-"); it_vobs.setFlags(Qt.ItemIsEnabled)
+        self.setItem(r, 8, it_vobs); widgets["vobs"] = it_vobs
+
         # VCF (computed)
         it_vcf = QTableWidgetItem("-"); it_vcf.setFlags(Qt.ItemIsEnabled)
-        self.setItem(r, 8, it_vcf); widgets["vcf"] = it_vcf
+        self.setItem(r, 9, it_vcf); widgets["vcf"] = it_vcf
 
         # Vol@15 (m³) (computed)
         it_v15 = QTableWidgetItem("-"); it_v15.setFlags(Qt.ItemIsEnabled)
-        self.setItem(r, 9, it_v15); widgets["v15"] = it_v15
+        self.setItem(r, 10, it_v15); widgets["v15"] = it_v15
 
         # Mass (t) (computed) — 2 decimals
         it_mass = QTableWidgetItem("-"); it_mass.setFlags(Qt.ItemIsEnabled)
-        self.setItem(r, 10, it_mass); widgets["mass"] = it_mass
+        self.setItem(r, 11, it_mass); widgets["mass"] = it_mass
 
         # Row Calc
         btn = QPushButton("Calc")
         btn.clicked.connect(lambda _=False, row=r: self.calc_one(row))
-        self.setCellWidget(r, 11, btn)
+        self.setCellWidget(r, 12, btn)  # shifted right by 1 due to new column
 
         widgets["code_full"] = code
         widgets["full100"] = float(full100)
@@ -195,8 +200,15 @@ class FuelTable(QTableWidget):
             dens15 = 0.0
         return code, is_sounding, level_cm, temp_c, dens15
 
-    def set_row_outputs(self, row: int, vcf: Optional[float], v15: Optional[float], mass_t: Optional[float]):
+    def set_row_outputs(
+        self, row: int,
+        v_obs: Optional[float],
+        vcf: Optional[float],
+        v15: Optional[float],
+        mass_t: Optional[float]
+    ):
         w = self._row_widgets[row]
+        w["vobs"].setText("-" if v_obs is None else f"{v_obs:.3f}")
         w["vcf"].setText("-" if vcf is None else f"{vcf:.6f}")
         w["v15"].setText("-" if v15 is None else f"{v15:.3f}")
         w["mass"].setText("-" if mass_t is None else f"{mass_t:.2f}")
@@ -209,7 +221,7 @@ class FuelTable(QTableWidget):
         code, is_sounding, level_cm, temp_c, dens15 = self.get_row_inputs(row)
 
         if level_cm == 0 and not is_sounding:
-            self.set_row_outputs(row, 1.0, 0.0, 0.0)
+            self.set_row_outputs(row, 0.0, 1.0, 0.0, 0.0)
             return
 
         try:
@@ -221,7 +233,7 @@ class FuelTable(QTableWidget):
                 heel=heel
             )
         except Exception:
-            self.set_row_outputs(row, None, None, None)
+            self.set_row_outputs(row, None, None, None, None)
             raise
 
         vcf = vcf_54b(dens15, temp_c)
@@ -229,7 +241,7 @@ class FuelTable(QTableWidget):
         v15 = max(0.0, v_obs * vcf)
         mass_t = max(0.0, (v15 * dens15) / 1000.0)
 
-        self.set_row_outputs(row, vcf, v15, mass_t)
+        self.set_row_outputs(row, v_obs, vcf, v15, mass_t)
 
     def sum_mass_t(self) -> float:
         total = 0.0
@@ -262,6 +274,7 @@ class FuelTable(QTableWidget):
                 dens = float(w["dens15"].text().replace(",", "."))
             except Exception:
                 dens = 0.0
+            vobs_txt = w["vobs"].text()
             vcf_txt = w["vcf"].text()
             v15_txt = w["v15"].text()
             mass_txt = w["mass"].text()
@@ -276,6 +289,7 @@ class FuelTable(QTableWidget):
                 "level_cm": level,
                 "temp_c": temp,
                 "dens15": dens,
+                "v_obs": float(vobs_txt) if vobs_txt not in ("-", "") else None,
                 "vcf": float(vcf_txt) if vcf_txt not in ("-", "") else None,
                 "v15": float(v15_txt) if v15_txt not in ("-", "") else None,
                 "mass_t": float(mass_txt) if mass_txt not in ("-", "") else None,
@@ -300,6 +314,9 @@ class FuelTable(QTableWidget):
             w["temp"].setValue(int(row.get("temp_c") or 25))
             w["dens15"].setText("" if row.get("dens15") is None else f"{row['dens15']}")
             # computed
+            # observed volume may not be saved; show if present
+            vobs = row.get("v_obs")
+            w["vobs"].setText("-" if vobs is None else f"{float(vobs):.3f}")
             w["vcf"].setText("-" if row.get("vcf") is None else f"{row['vcf']:.6f}")
             w["v15"].setText("-" if row.get("v15") is None else f"{row['v15']:.3f}")
             w["mass"].setText("-" if row.get("mass_t") is None else f"{row['mass_t']:.2f}")
@@ -419,12 +436,12 @@ class MainWindow(QWidget):
 
         # Bottom bar
         bottom = QHBoxLayout()
-        # New: Save & Retrieve
-        self.btnSave = QPushButton("Save to ops.db")
+        # Buttons renamed
+        self.btnSave = QPushButton("Save")
         self.btnSave.clicked.connect(self.save_to_ops)
         bottom.addWidget(self.btnSave)
 
-        self.btnLoad = QPushButton("Retrieve from ops.db")
+        self.btnLoad = QPushButton("Retrieve")
         self.btnLoad.clicked.connect(self.retrieve_from_ops)
         bottom.addWidget(self.btnLoad)
 
@@ -521,7 +538,7 @@ class MainWindow(QWidget):
 
     def install_row_handlers(self, table: FuelTable, is_hfo: bool):
         for r in range(table.rowCount()):
-            btn = table.cellWidget(r, 11)  # Calc
+            btn = table.cellWidget(r, 12)  # Calc column index updated
             try:
                 btn.clicked.disconnect()
             except Exception:
@@ -761,7 +778,8 @@ class MainWindow(QWidget):
             rd = {
                 "code": code, "desc": desc, "full100": full100, "full95": full95,
                 "at_fill_m3": at_fill_m3, "mode": mode, "level_cm": level_cm,
-                "temp_c": temp_c, "dens15": dens15, "vcf": vcf, "v15": v15, "mass_t": mass_t
+                "temp_c": temp_c, "dens15": dens15, "vcf": vcf, "v15": v15, "mass_t": mass_t,
+                # "v_obs" isn't stored in DB; it will recompute on next Calculate
             }
             (rows_hfo if fuel == "HFO" else rows_mgo).append(rd)
 
