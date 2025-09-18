@@ -35,3 +35,6 @@ venv/
 data/*.db
 data/*.db.bak
 *.bak
+
+# local databases
+data/*.db
