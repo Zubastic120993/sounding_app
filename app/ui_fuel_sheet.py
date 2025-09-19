@@ -29,7 +29,6 @@ DB_CAP_PATH = ROOT / "data" / "sounding.db"
 DB_OPS_PATH = ROOT / "data" / "ops.db"
 
 # ---------------- fixed tank lists ----------------
-# HFO rows: (code, description, full_100_m3, full_95_m3)
 HFO_ROWS = [
     ("FO1P_NO1_HFO_TK_P", "HFO Tk 1 P", 254.2, 241.5),
     ("FO1S_NO1_HFO_TK_S", "HFO Tk 1 S", 254.2, 241.5),
@@ -40,7 +39,6 @@ HFO_ROWS = [
     ("FOV2_HFO_SERV_2",   "HFO Serv. Tk 2",  45.3,  43.0),
 ]
 
-# MGO rows (100% & 95% from your sheet)
 MGO_ROWS = [
     ("GO2C_NO2_MGO_TK", "MGO Tk 2 Central", 234.50, 222.78),
     ("GOV1_MGO_SERV_1", "MGO Serv. Tk 1",    74.50,  70.78),
@@ -49,13 +47,11 @@ MGO_ROWS = [
 
 GREEN = "background-color:#eaffea;"
 
-# Default Ullage rows (HFO 1P, 1S, 3C)
 DEFAULT_ULL_CODES = {
     "FO1P_NO1_HFO_TK_P",
     "FO1S_NO1_HFO_TK_S",
     "FO3C_NO3_HFO_TK",
 }
-
 
 def msg(text: str):
     m = QMessageBox()
@@ -63,25 +59,57 @@ def msg(text: str):
     m.setText(text)
     m.exec()
 
-
 def info(text: str):
     m = QMessageBox()
     m.setIcon(QMessageBox.Information)
     m.setText(text)
     m.exec()
 
-
 def short_code(full_code: str) -> str:
-    """Return TK No prefix before first underscore, e.g. 'FO1P'."""
     return full_code.split("_", 1)[0] if "_" in full_code else full_code
 
+# ---------- NEW: read min/max sounding/ullage per tank from capacity DB ----------
+CANDIDATE_COLS = ("sounding", "ullage", "sound", "ull", "level")
+
+def tank_level_bounds(code: str) -> Tuple[int, int, bool]:
+    """
+    Return (min_cm, max_cm, from_db).
+    Tries to read MIN/MAX over any of CANDIDATE_COLS in table `readings` for the given name.
+    If nothing works, falls back to (0, 4000, False).
+    """
+    min_cm: Optional[float] = None
+    max_cm: Optional[float] = None
+    try:
+        con = sqlite3.connect(DB_CAP_PATH)
+        cur = con.cursor()
+        # ensure table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='readings'")
+        if cur.fetchone():
+            for col in CANDIDATE_COLS:
+                try:
+                    cur.execute(f"SELECT MIN({col}), MAX({col}) FROM readings WHERE name=?", (code,))
+                    row = cur.fetchone()
+                    if row and row[0] is not None and row[1] is not None:
+                        cmin, cmax = float(row[0]), float(row[1])
+                        # combine across cols: we want the widest safe range
+                        min_cm = cmin if min_cm is None else min(min_cm, cmin)
+                        max_cm = cmax if max_cm is None else max(max_cm, cmax)
+                except sqlite3.Error:
+                    # column may not exist; try next
+                    continue
+        con.close()
+    except Exception:
+        pass
+
+    if min_cm is None or max_cm is None or min_cm >= max_cm:
+        return (0, 4000, False)   # safe wide fallback
+    return (max(0, int(min_cm)), int(max_cm), True)
 
 class FuelTable(QTableWidget):
     COLS = [
         "Tk", "Description", "100% Full (m³)", "At Fill % (m³)",
         "Mode", "Level (cm)", "Temp (°C)", "Density@15 (kg/m³)",
-        "Observed Vol (m³)",   # NEW
-        "VCF", "Vol@15 (m³)", "Mass (t)", "Calc"
+        "Observed Vol (m³)", "VCF", "Vol@15 (m³)", "Mass (t)", "Calc"
     ]
 
     def __init__(self, rows_spec, is_hfo: bool, parent=None):
@@ -93,7 +121,6 @@ class FuelTable(QTableWidget):
         self.setRowCount(len(rows_spec))
         self._row_widgets: List[Dict[str, Any]] = []
 
-        # --- header font & size ---
         header_font = QFont()
         header_font.setPointSize(13)
         header_font.setBold(True)
@@ -105,7 +132,6 @@ class FuelTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.setAlternatingRowColors(True)
 
-        # first column narrower
         self.setColumnWidth(0, 55)
 
         for r, spec in enumerate(rows_spec):
@@ -115,71 +141,65 @@ class FuelTable(QTableWidget):
         widgets: Dict[str, Any] = {}
         code, desc, full100, full95 = spec
 
-        # TK No short
         it_code = QTableWidgetItem(short_code(code)); it_code.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 0, it_code)
 
-        # Description
         it_desc = QTableWidgetItem(desc); it_desc.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 1, it_desc)
 
-        # 100% Full (1 decimal)
         it_100 = QTableWidgetItem(f"{float(full100):.1f}"); it_100.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 2, it_100)
 
-        # At Fill % (m³) – computed (1 decimal)
         it_fill = QTableWidgetItem("-"); it_fill.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 3, it_fill)
 
-        # Mode radios (default Ullage for selected HFO tanks)
         w_mode = QWidget()
         hb = QHBoxLayout(w_mode); hb.setContentsMargins(0,0,0,0)
         rb_s = QRadioButton("So")
         rb_u = QRadioButton("Ull")
         default_is_ull = (code in DEFAULT_ULL_CODES) and self.is_hfo
-        rb_s.setChecked(not default_is_ull)
+        rb_s.setChecked(default_is_ull) if False else rb_s.setChecked(not default_is_ull)  # keep line length sane
         rb_u.setChecked(default_is_ull)
         hb.addWidget(rb_s); hb.addWidget(rb_u); hb.addStretch(1)
         self.setCellWidget(r, 4, w_mode)
         widgets["rb_s"], widgets["rb_u"] = rb_s, rb_u
 
-        # Level (cm)
-        sp_level = QSpinBox(); sp_level.setRange(0, 2000); sp_level.setValue(0)
+        # --------- NEW: per-tank limits from DB (fallback 0–4000) ----------
+        min_cm, max_cm, from_db = tank_level_bounds(code)
+
+        sp_level = QSpinBox()
+        sp_level.setRange(min_cm, max_cm)
+        sp_level.setValue(min_cm)
         sp_level.setStyleSheet(GREEN)
+        tip_src = "capacity DB" if from_db else "fallback"
+        sp_level.setToolTip(f"Allowed range: {min_cm}–{max_cm} cm ({tip_src}).")
         self.setCellWidget(r, 5, sp_level); widgets["level"] = sp_level
 
-        # Temp (°C)
         sp_temp = QSpinBox(); sp_temp.setRange(-20, 120); sp_temp.setValue(25)
         sp_temp.setStyleSheet(GREEN)
         self.setCellWidget(r, 6, sp_temp); widgets["temp"] = sp_temp
 
-        # Density@15
         default_dens = 953.6 if self.is_hfo else 850.0
         de = QLineEdit(f"{default_dens}")
         de.setValidator(QDoubleValidator(500.0, 1200.0, 3))
         de.setStyleSheet(GREEN)
         self.setCellWidget(r, 7, de); widgets["dens15"] = de
 
-        # Observed Vol (m³) – computed
         it_vobs = QTableWidgetItem("-"); it_vobs.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 8, it_vobs); widgets["vobs"] = it_vobs
 
-        # VCF (computed)
         it_vcf = QTableWidgetItem("-"); it_vcf.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 9, it_vcf); widgets["vcf"] = it_vcf
 
-        # Vol@15 (m³) (computed)
         it_v15 = QTableWidgetItem("-"); it_v15.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 10, it_v15); widgets["v15"] = it_v15
 
-        # Mass (t) (computed) — 2 decimals
         it_mass = QTableWidgetItem("-"); it_mass.setFlags(Qt.ItemIsEnabled)
         self.setItem(r, 11, it_mass); widgets["mass"] = it_mass
 
-        # Row Calc
         btn = QPushButton("Calc")
         btn.clicked.connect(lambda _=False, row=r: self.calc_one(row))
-        self.setCellWidget(r, 12, btn)  # shifted right by 1 due to new column
+        self.setCellWidget(r, 12, btn)
 
         widgets["code_full"] = code
         widgets["full100"] = float(full100)
@@ -200,13 +220,11 @@ class FuelTable(QTableWidget):
             dens15 = 0.0
         return code, is_sounding, level_cm, temp_c, dens15
 
-    def set_row_outputs(
-        self, row: int,
-        v_obs: Optional[float],
-        vcf: Optional[float],
-        v15: Optional[float],
-        mass_t: Optional[float]
-    ):
+    def set_row_outputs(self, row: int,
+                        v_obs: Optional[float],
+                        vcf: Optional[float],
+                        v15: Optional[float],
+                        mass_t: Optional[float]):
         w = self._row_widgets[row]
         w["vobs"].setText("-" if v_obs is None else f"{v_obs:.3f}")
         w["vcf"].setText("-" if vcf is None else f"{vcf:.6f}")
@@ -214,10 +232,6 @@ class FuelTable(QTableWidget):
         w["mass"].setText("-" if mass_t is None else f"{mass_t:.2f}")
 
     def calc_one(self, row: int, trim: float = 0.0, heel: Optional[str] = None):
-        """
-        Calculate volumes based on sounding/ullage only.
-        NOTE: Fill % does NOT affect these outputs; it's display-only for column 4.
-        """
         code, is_sounding, level_cm, temp_c, dens15 = self.get_row_inputs(row)
 
         if level_cm == 0 and not is_sounding:
@@ -237,10 +251,9 @@ class FuelTable(QTableWidget):
             raise
 
         vcf = vcf_54b(dens15, temp_c)
-        v_obs = max(0.0, v_obs)         # clamp negatives to 0
+        v_obs = max(0.0, v_obs)
         v15 = max(0.0, v_obs * vcf)
         mass_t = max(0.0, (v15 * dens15) / 1000.0)
-
         self.set_row_outputs(row, v_obs, vcf, v15, mass_t)
 
     def sum_mass_t(self) -> float:
@@ -254,7 +267,6 @@ class FuelTable(QTableWidget):
                     pass
         return total
 
-    # ---- recompute the “At Fill % (m³)” column; and the column header text ----
     def update_fill_column(self, fill_pct: float):
         scale = max(0.0, min(100.0, fill_pct)) / 100.0
         for r in range(self.rowCount()):
@@ -263,9 +275,7 @@ class FuelTable(QTableWidget):
             self._row_widgets[r]["fill_col_item"].setText(f"{val:.1f}")
         self.setHorizontalHeaderItem(3, QTableWidgetItem(f"At {fill_pct:.0f}% (m³)"))
 
-    # ---- helpers for save/load ----
     def iter_rows(self):
-        """Yield per-row dict with inputs and computed outputs."""
         for r, w in enumerate(self._row_widgets):
             mode = "So" if w["rb_s"].isChecked() else "Ull"
             level = float(w["level"].value())
@@ -296,7 +306,6 @@ class FuelTable(QTableWidget):
             }
 
     def apply_rows(self, rows: List[Dict[str, Any]]):
-        """Load rows (by code) into the table."""
         idx_by_code = {w["code_full"]: i for i, w in enumerate(self._row_widgets)}
         for row in rows:
             code = row["code"]
@@ -304,26 +313,20 @@ class FuelTable(QTableWidget):
                 continue
             r = idx_by_code[code]
             w = self._row_widgets[r]
-            # mode
             if row.get("mode", "So") == "So":
                 w["rb_s"].setChecked(True)
             else:
                 w["rb_u"].setChecked(True)
-            # inputs
             w["level"].setValue(int(row.get("level_cm") or 0))
             w["temp"].setValue(int(row.get("temp_c") or 25))
             w["dens15"].setText("" if row.get("dens15") is None else f"{row['dens15']}")
-            # computed
-            # observed volume may not be saved; show if present
             vobs = row.get("v_obs")
             w["vobs"].setText("-" if vobs is None else f"{float(vobs):.3f}")
             w["vcf"].setText("-" if row.get("vcf") is None else f"{row['vcf']:.6f}")
             w["v15"].setText("-" if row.get("v15") is None else f"{row['v15']:.3f}")
             w["mass"].setText("-" if row.get("mass_t") is None else f"{row['mass_t']:.2f}")
-            # at fill
             if row.get("at_fill_m3") is not None:
                 w["fill_col_item"].setText(f"{row['at_fill_m3']:.1f}")
-
 
 class MainWindow(QWidget):
     _HEEL_TOKEN_RE = re.compile(r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*([PS])\s*$", re.I)
@@ -335,8 +338,6 @@ class MainWindow(QWidget):
 
         # Top controls
         top = QHBoxLayout()
-
-        # DATE
         top.addWidget(QLabel("Date:"))
         self.deDate = QDateEdit(QDate.currentDate())
         self.deDate.setCalendarPopup(True)
@@ -344,7 +345,6 @@ class MainWindow(QWidget):
         self.deDate.setFixedWidth(120)
         top.addWidget(self.deDate)
 
-        # Trim
         top.addSpacing(12)
         top.addWidget(QLabel("Trim:"))
         self.leTrim = QLineEdit("0.00")
@@ -353,7 +353,6 @@ class MainWindow(QWidget):
         self.leTrim.setToolTip("Trim, meters (e.g., -2.5, 0, 1.0)")
         top.addWidget(self.leTrim)
 
-        # Heel (numeric or tokens)
         top.addSpacing(12)
         top.addWidget(QLabel("Heel:"))
         self.leHeel = QLineEdit("0")
@@ -361,14 +360,10 @@ class MainWindow(QWidget):
         self.leHeel.setValidator(QDoubleValidator(-10.0, 10.0, 2))
         self.leHeel.setPlaceholderText("e.g., 1 (Port), -0.5 (Stbd), 0,5P, 0,5S")
         self.leHeel.setToolTip(
-            "Heel rule:\n"
-            "• Port → enter >0 or token like 0,5P\n"
-            "• Starboard → enter <0 or token like 0,5S\n"
-            "Commas or dots allowed."
+            "Heel rule:\n• Port → enter >0 or token like 0,5P\n• Starboard → enter <0 or token like 0,5S\nCommas or dots allowed."
         )
         top.addWidget(self.leHeel)
 
-        # Fill %
         top.addSpacing(20)
         top.addWidget(QLabel("Fill % (HFO):"))
         self.leFillHFO = QLineEdit("0.00")
@@ -385,17 +380,14 @@ class MainWindow(QWidget):
 
         top.addStretch(1)
 
-        # Bold font for footers & log book widgets
         foot_bold = QFont(); foot_bold.setBold(True)
 
-        # HFO group
         gH = QGroupBox("HFO Tanks")
         fH = gH.font(); fH.setPointSize(14); gH.setFont(fH)
         vH = QVBoxLayout(gH)
         self.tblHFO = FuelTable(HFO_ROWS, is_hfo=True)
         vH.addWidget(self.tblHFO)
 
-        # HFO totals line with Log Book & Diff
         hfoFooter = QHBoxLayout()
         self.lblTotalHFO = QLabel("TOTAL 0.00 (t)")
         self.lblTotalHFO.setAlignment(Qt.AlignRight)
@@ -411,14 +403,12 @@ class MainWindow(QWidget):
         hfoFooter.addWidget(self.lblDiffHFO)
         vH.addLayout(hfoFooter)
 
-        # MGO group
         gM = QGroupBox("MGO Tanks")
         fM = gM.font(); fM.setPointSize(14); gM.setFont(fM)
         vM = QVBoxLayout(gM)
         self.tblMGO = FuelTable(MGO_ROWS, is_hfo=False)
         vM.addWidget(self.tblMGO)
 
-        # MGO totals line with Log Book & Diff
         mgoFooter = QHBoxLayout()
         self.lblTotalMGO = QLabel("TOTAL 0.00 (t)")
         self.lblTotalMGO.setAlignment(Qt.AlignRight)
@@ -434,9 +424,7 @@ class MainWindow(QWidget):
         mgoFooter.addWidget(self.lblDiffMGO)
         vM.addLayout(mgoFooter)
 
-        # Bottom bar
         bottom = QHBoxLayout()
-        # Buttons renamed
         self.btnSave = QPushButton("Save")
         self.btnSave.clicked.connect(self.save_to_ops)
         bottom.addWidget(self.btnSave)
@@ -445,7 +433,6 @@ class MainWindow(QWidget):
         self.btnLoad.clicked.connect(self.retrieve_from_ops)
         bottom.addWidget(self.btnLoad)
 
-        # Existing Calculate
         self.btnCalcAll = QPushButton("Calculate")
         self.btnCalcAll.clicked.connect(self.calc_all)
         bottom.addWidget(self.btnCalcAll)
@@ -457,45 +444,30 @@ class MainWindow(QWidget):
         self.lblDB = QLabel(f"DB: {DB_CAP_PATH}")
         bottom.addWidget(self.lblDB)
 
-        # Layout
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(gH)
         layout.addWidget(gM)
         layout.addLayout(bottom)
 
-        # wiring
         self.install_row_handlers(self.tblHFO, is_hfo=True)
         self.install_row_handlers(self.tblMGO, is_hfo=False)
 
-        # Fill% change -> only update column 4 & header (no recalculation)
         self.leFillHFO.editingFinished.connect(self._on_fill_hfo_changed)
         self.leFillMGO.editingFinished.connect(self._on_fill_mgo_changed)
 
-        # LogBook edits -> refresh diffs
         self.leLogHFO.editingFinished.connect(self.update_totals)
         self.leLogMGO.editingFinished.connect(self.update_totals)
 
-        # Initialize headers/columns
         self.tblHFO.update_fill_column(0.0)
         self.tblMGO.update_fill_column(0.0)
 
-        # Ensure ops DB exists with schema
         self._ensure_ops_schema()
 
-    # ---- helpers ----
     def _parse_heel(self, raw: str) -> str:
-        """
-        Accepts numeric (e.g. '1', '-2.5') or tokens like '0,5P'/'0,5S'.
-        Rule:
-          - Port  -> enter >0 or token with 'P'  -> '{val}P'
-          - Starb -> enter <0 or token with 'S'  -> '{abs(val)}S'
-        """
         s = raw.strip().upper().replace(" ", "")
         if not s:
             return "0"
-
-        # explicit token like 0,5P / 0.5S
         m = self._HEEL_TOKEN_RE.match(s)
         if m:
             val = m.group(1).replace(",", ".")
@@ -505,15 +477,12 @@ class MainWindow(QWidget):
             except ValueError:
                 return "0"
             return f"{val}{side}"
-
-        # plain numeric with sign
         try:
             val = float(s.replace(",", "."))
         except ValueError:
             if s in ("P", "S"):
                 return "0" + s
             return "0"
-
         if val == 0:
             return "0"
         side = "P" if val > 0 else "S"
@@ -538,14 +507,13 @@ class MainWindow(QWidget):
 
     def install_row_handlers(self, table: FuelTable, is_hfo: bool):
         for r in range(table.rowCount()):
-            btn = table.cellWidget(r, 12)  # Calc column index updated
+            btn = table.cellWidget(r, 12)
             try:
                 btn.clicked.disconnect()
             except Exception:
                 pass
             btn.clicked.connect(lambda _=False, row=r, t=table, hf=is_hfo: self.calc_one_row(t, row, hf))
 
-    # ---- Fill% change hooks (display-only) ----
     def _on_fill_hfo_changed(self):
         pct = self._current_fill(True)
         self.tblHFO.update_fill_column(pct)
@@ -554,7 +522,6 @@ class MainWindow(QWidget):
         pct = self._current_fill(False)
         self.tblMGO.update_fill_column(pct)
 
-    # ---- calc operations ----
     def calc_one_row(self, table: FuelTable, row: int, is_hfo: bool):
         try:
             trim, heel = self._current_trim_heel()
@@ -573,21 +540,16 @@ class MainWindow(QWidget):
             trim, heel = self._current_trim_heel()
         except Exception:
             return
-
-        # HFO
         for r in range(self.tblHFO.rowCount()):
             try:
                 self.tblHFO.calc_one(r, trim=trim, heel=heel)
             except Exception:
                 pass
-
-        # MGO
         for r in range(self.tblMGO.rowCount()):
             try:
                 self.tblMGO.calc_one(r, trim=trim, heel=heel)
             except Exception:
                 pass
-
         self.update_totals()
 
     def _parse_float(self, s: str) -> float:
@@ -598,35 +560,29 @@ class MainWindow(QWidget):
 
     def _set_diff_style(self, label: QLabel, diff: float):
         if diff > 0:
-            label.setStyleSheet("color:#0a7a0a; font-weight:600;")  # green-ish
+            label.setStyleSheet("color:#0a7a0a; font-weight:600;")
         elif diff < 0:
-            label.setStyleSheet("color:#c21807; font-weight:600;")  # red-ish
+            label.setStyleSheet("color:#c21807; font-weight:600;")
         else:
             label.setStyleSheet("color:inherit; font-weight:600;")
 
     def update_totals(self):
         hfo = self.tblHFO.sum_mass_t()
         mgo = self.tblMGO.sum_mass_t()
-
         self.lblTotalHFO.setText(f"TOTAL {hfo:.2f} (t)")
         self.lblTotalMGO.setText(f"TOTAL {mgo:.2f} (t)")
-
-        # compute diffs vs Log Book
         log_hfo = self._parse_float(self.leLogHFO.text())
         log_mgo = self._parse_float(self.leLogMGO.text())
         diff_hfo = hfo - log_hfo
         diff_mgo = mgo - log_mgo
-
         self.lblDiffHFO.setText(f"{diff_hfo:.2f}")
         self.lblDiffMGO.setText(f"{diff_mgo:.2f}")
         self._set_diff_style(self.lblDiffHFO, diff_hfo)
         self._set_diff_style(self.lblDiffMGO, diff_mgo)
-
         self.lblGrand.setText(
             f"Total HFO (t): {hfo:.2f}    Total MGO (t): {mgo:.2f}    Grand Total (t): {hfo+mgo:.2f}"
         )
 
-    # --------- Save / Retrieve (ops.db) ----------
     def _ensure_ops_schema(self):
         DB_OPS_PATH.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(DB_OPS_PATH)
@@ -649,13 +605,13 @@ class MainWindow(QWidget):
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ops_rows (
                 date_text TEXT,
-                fuel      TEXT,     -- 'HFO' or 'MGO'
+                fuel      TEXT,
                 code      TEXT,
                 desc      TEXT,
                 full100   REAL,
                 full95    REAL,
                 at_fill_m3 REAL,
-                mode      TEXT,     -- 'So' or 'Ull'
+                mode      TEXT,
                 level_cm  REAL,
                 temp_c    REAL,
                 dens15    REAL,
@@ -674,7 +630,6 @@ class MainWindow(QWidget):
         heel = self._parse_heel(self.leHeel.text())
         fill_hfo = self._parse_float(self.leFillHFO.text())
         fill_mgo = self._parse_float(self.leFillMGO.text())
-        # Totals
         hfo = self.tblHFO.sum_mass_t()
         mgo = self.tblMGO.sum_mass_t()
         state = {
@@ -699,7 +654,6 @@ class MainWindow(QWidget):
         state = self._collect_state()
         con = sqlite3.connect(DB_OPS_PATH)
         cur = con.cursor()
-        # Upsert header
         h = state["header"]
         cur.execute("""
             INSERT INTO ops_header (date_text, trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo, total_hfo, total_mgo, grand_total)
@@ -710,8 +664,8 @@ class MainWindow(QWidget):
                 log_hfo=excluded.log_hfo, log_mgo=excluded.log_mgo,
                 total_hfo=excluded.total_hfo, total_mgo=excluded.total_mgo,
                 grand_total=excluded.grand_total
-        """, (h["date_text"], h["trim"], h["heel"], h["fill_hfo"], h["fill_mgo"], h["log_hfo"], h["log_mgo"], h["total_hfo"], h["total_mgo"], h["grand_total"]))
-        # Replace detail rows for this date
+        """, (h["date_text"], h["trim"], h["heel"], h["fill_hfo"], h["fill_mgo"],
+              h["log_hfo"], h["log_mgo"], h["total_hfo"], h["total_mgo"], h["grand_total"]))
         cur.execute("DELETE FROM ops_rows WHERE date_text=?", (h["date_text"],))
         for fuel, rows in (("HFO", state["rows_hfo"]), ("MGO", state["rows_mgo"])):
             for r in rows:
@@ -726,7 +680,6 @@ class MainWindow(QWidget):
         info(f"Saved to {DB_OPS_PATH}\nDate: {h['date_text']}")
 
     def retrieve_from_ops(self):
-        # Show available dates
         con = sqlite3.connect(DB_OPS_PATH)
         cur = con.cursor()
         try:
@@ -738,14 +691,10 @@ class MainWindow(QWidget):
             con.close()
             msg("No saved entries found in ops.db.")
             return
-
-        # Let user pick a date
         date_text, ok = QInputDialog.getItem(self, "Retrieve saved data", "Available dates:", dates, 0, False)
         if not ok or not date_text:
             con.close()
             return
-
-        # Load header
         cur.execute("SELECT trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo FROM ops_header WHERE date_text=?", (date_text,))
         row = cur.fetchone()
         if not row:
@@ -753,25 +702,20 @@ class MainWindow(QWidget):
             msg("Selected date not found.")
             return
         trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo = row
-
-        # Load rows
         cur.execute("SELECT fuel, code, desc, full100, full95, at_fill_m3, mode, level_cm, temp_c, dens15, vcf, v15, mass_t FROM ops_rows WHERE date_text=?", (date_text,))
         rows = cur.fetchall()
         con.close()
 
-        # Apply header to UI
         d = QDate.fromString(date_text, "yyyy-MM-dd")
         if d.isValid():
             self.deDate.setDate(d)
         self.leTrim.setText(f"{trim:.2f}")
-        # heel is stored like '0.5P'/'0.5S'/'0'; show as typed token
         self.leHeel.setText(heel)
         self.leFillHFO.setText(f"{fill_hfo:.2f}")
         self.leFillMGO.setText(f"{fill_mgo:.2f}")
         self.leLogHFO.setText(f"{(log_hfo or 0):.2f}")
         self.leLogMGO.setText(f"{(log_mgo or 0):.2f}")
 
-        # Build row dicts split by fuel
         rows_hfo: List[Dict[str, Any]] = []
         rows_mgo: List[Dict[str, Any]] = []
         for (fuel, code, desc, full100, full95, at_fill_m3, mode, level_cm, temp_c, dens15, vcf, v15, mass_t) in rows:
@@ -779,15 +723,11 @@ class MainWindow(QWidget):
                 "code": code, "desc": desc, "full100": full100, "full95": full95,
                 "at_fill_m3": at_fill_m3, "mode": mode, "level_cm": level_cm,
                 "temp_c": temp_c, "dens15": dens15, "vcf": vcf, "v15": v15, "mass_t": mass_t,
-                # "v_obs" isn't stored in DB; it will recompute on next Calculate
             }
             (rows_hfo if fuel == "HFO" else rows_mgo).append(rd)
 
-        # Apply to tables
         self.tblHFO.apply_rows(rows_hfo)
         self.tblMGO.apply_rows(rows_mgo)
-
-        # Refresh totals & At Fill% headers/columns for current Fill% values
         self._on_fill_hfo_changed()
         self._on_fill_mgo_changed()
         self.update_totals()
@@ -802,6 +742,6 @@ def main():
     w.show()
     sys.exit(app.exec())
 
-
 if __name__ == "__main__":
     main()
+
