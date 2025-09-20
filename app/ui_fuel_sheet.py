@@ -10,13 +10,13 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QDoubleValidator, QFont
+
 from PySide6.QtWidgets import (
     QApplication, QWidget, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QMessageBox, QHeaderView, QAbstractItemView, QDateEdit,
-    QInputDialog
+    QInputDialog, QDialog, QListWidget, QListWidgetItem
 )
-
 # ----- import path so "from app..." works when run as script
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -327,7 +327,33 @@ class FuelTable(QTableWidget):
             w["mass"].setText("-" if row.get("mass_t") is None else f"{row['mass_t']:.2f}")
             if row.get("at_fill_m3") is not None:
                 w["fill_col_item"].setText(f"{row['at_fill_m3']:.1f}")
+class RetrieveEntryDialog(QDialog):
+    def __init__(self, dates: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Retrieve entry")
+        self.resize(380, 420)
 
+        v = QVBoxLayout(self)
+        self.listw = QListWidget(self)
+        for dt in dates:
+            QListWidgetItem(dt, self.listw)
+        self.listw.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.listw.itemDoubleClicked.connect(self.accept)  # double-click = Load
+        v.addWidget(self.listw)
+
+        h = QHBoxLayout()
+        h.addStretch(1)
+        self.btnLoad = QPushButton("Load", self)
+        self.btnCancel = QPushButton("Cancel", self)
+        self.btnLoad.clicked.connect(self.accept)
+        self.btnCancel.clicked.connect(self.reject)
+        h.addWidget(self.btnLoad)
+        h.addWidget(self.btnCancel)
+        v.addLayout(h)
+
+    def selected_date(self) -> str | None:
+        it = self.listw.currentItem()
+        return it.text() if it else None
 class MainWindow(QWidget):
     _HEEL_TOKEN_RE = re.compile(r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*([PS])\s*$", re.I)
 
@@ -357,7 +383,7 @@ class MainWindow(QWidget):
         top.addWidget(QLabel("Heel:"))
         self.leHeel = QLineEdit("0")
         self.leHeel.setFixedWidth(100)
-        self.leHeel.setValidator(QDoubleValidator(-10.0, 10.0, 2))
+        #self.leHeel.setValidator(QDoubleValidator(-10.0, 10.0, 2))
         self.leHeel.setPlaceholderText("e.g., 1 (Port), -0.5 (Stbd), 0,5P, 0,5S")
         self.leHeel.setToolTip(
             "Heel rule:\n• Port → enter >0 or token like 0,5P\n• Starboard → enter <0 or token like 0,5S\nCommas or dots allowed."
@@ -691,34 +717,52 @@ class MainWindow(QWidget):
             con.close()
             msg("No saved entries found in ops.db.")
             return
-        date_text, ok = QInputDialog.getItem(self, "Retrieve saved data", "Available dates:", dates, 0, False)
-        if not ok or not date_text:
+
+        dlg = RetrieveEntryDialog(dates, self)
+        if dlg.exec() != QDialog.Accepted:
             con.close()
             return
-        cur.execute("SELECT trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo FROM ops_header WHERE date_text=?", (date_text,))
+        date_text = dlg.selected_date()
+        if not date_text:
+            con.close()
+            return
+
+        cur.execute(
+            "SELECT trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo "
+            "FROM ops_header WHERE date_text=?",
+            (date_text,)
+        )
         row = cur.fetchone()
         if not row:
             con.close()
             msg("Selected date not found.")
             return
         trim, heel, fill_hfo, fill_mgo, log_hfo, log_mgo = row
-        cur.execute("SELECT fuel, code, desc, full100, full95, at_fill_m3, mode, level_cm, temp_c, dens15, vcf, v15, mass_t FROM ops_rows WHERE date_text=?", (date_text,))
+
+        cur.execute(
+            "SELECT fuel, code, desc, full100, full95, at_fill_m3, mode, "
+            "level_cm, temp_c, dens15, vcf, v15, mass_t "
+            "FROM ops_rows WHERE date_text=?",
+            (date_text,)
+        )
         rows = cur.fetchall()
         con.close()
 
         d = QDate.fromString(date_text, "yyyy-MM-dd")
         if d.isValid():
             self.deDate.setDate(d)
-        self.leTrim.setText(f"{trim:.2f}")
-        self.leHeel.setText(heel)
-        self.leFillHFO.setText(f"{fill_hfo:.2f}")
-        self.leFillMGO.setText(f"{fill_mgo:.2f}")
+
+        # ensure robust formatting (None-safe)
+        self.leTrim.setText(f"{(trim or 0):.2f}")
+        self.leHeel.setText(heel or "0")
+        self.leFillHFO.setText(f"{(fill_hfo or 0):.2f}")
+        self.leFillMGO.setText(f"{(fill_mgo or 0):.2f}")
         self.leLogHFO.setText(f"{(log_hfo or 0):.2f}")
         self.leLogMGO.setText(f"{(log_mgo or 0):.2f}")
 
-        rows_hfo: List[Dict[str, Any]] = []
-        rows_mgo: List[Dict[str, Any]] = []
-        for (fuel, code, desc, full100, full95, at_fill_m3, mode, level_cm, temp_c, dens15, vcf, v15, mass_t) in rows:
+        rows_hfo, rows_mgo = [], []
+        for (fuel, code, desc, full100, full95, at_fill_m3, mode,
+            level_cm, temp_c, dens15, vcf, v15, mass_t) in rows:
             rd = {
                 "code": code, "desc": desc, "full100": full100, "full95": full95,
                 "at_fill_m3": at_fill_m3, "mode": mode, "level_cm": level_cm,

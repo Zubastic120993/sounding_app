@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QMessageBox, QHeaderView, QAbstractItemView, QDateEdit,
+    QDialog, QListWidget, QListWidgetItem,
     QInputDialog
 )
 
@@ -328,6 +329,35 @@ class LOTable(QTableWidget):
             at_fill = row.get("at_fill_l")
             if at_fill is not None:
                 self._row_widgets[i]["fill_col_item"].setText(f"{int(at_fill):,}".replace(",", " "))
+
+# Reuse the same dialog class
+class RetrieveEntryDialog(QDialog):
+    def __init__(self, dates: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Retrieve LO entry")
+        self.resize(380, 420)
+
+        v = QVBoxLayout(self)
+        self.listw = QListWidget(self)
+        for dt in dates:
+            QListWidgetItem(dt, self.listw)
+        self.listw.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.listw.itemDoubleClicked.connect(self.accept)
+        v.addWidget(self.listw)
+
+        h = QHBoxLayout()
+        h.addStretch(1)
+        btnLoad = QPushButton("Load", self)
+        btnCancel = QPushButton("Cancel", self)
+        btnLoad.clicked.connect(self.accept)
+        btnCancel.clicked.connect(self.reject)
+        h.addWidget(btnLoad)
+        h.addWidget(btnCancel)
+        v.addLayout(h)
+
+    def selected_date(self) -> str | None:
+        it = self.listw.currentItem()
+        return it.text() if it else None
 
 # ------------- Main Window -------------
 class MainWindow(QWidget):
@@ -784,63 +814,106 @@ class MainWindow(QWidget):
         info(f"Saved LO sheet to {DB_OPS_PATH}\nDate: {h['date_text']}")
 
     def retrieve_from_ops(self):
-        con = sqlite3.connect(DB_OPS_PATH); cur = con.cursor()
+        con = sqlite3.connect(DB_OPS_PATH)
+        cur = con.cursor()
+
         try:
             cur.execute("SELECT date_text FROM lo_header ORDER BY date_text DESC")
             dates = [r[0] for r in cur.fetchall()]
         except sqlite3.Error:
             dates = []
+
         if not dates:
-            con.close(); msg("No LO saved entries found in ops.db."); return
-        date_text, ok = QInputDialog.getItem(self, "Retrieve LO saved data", "Available dates:", dates, 0, False)
-        if not ok or not date_text: con.close(); return
+            con.close()
+            msg("No LO saved entries found in ops.db.")
+            return
 
-        cur.execute("""SELECT trim, heel,
-                              g1_oil_name, g1_dens15, g2_oil_name, g2_dens15, g3_oil_name, g3_dens15,
-                              fill_me_circ, fill_me_cyl, fill_ae_circ,
-                              log_me_circ, log_me_cyl, log_ae_circ
-                       FROM lo_header WHERE date_text=?""", (date_text,))
+        dlg = RetrieveEntryDialog(dates, self)
+        if dlg.exec() != QDialog.Accepted:
+            con.close()
+            return
+        date_text = dlg.selected_date()
+        if not date_text:
+            con.close()
+            return
+
+        cur.execute(
+            """SELECT trim, heel,
+                    g1_oil_name, g1_dens15, g2_oil_name, g2_dens15, g3_oil_name, g3_dens15,
+                    fill_me_circ, fill_me_cyl, fill_ae_circ,
+                    log_me_circ, log_me_cyl, log_ae_circ
+            FROM lo_header WHERE date_text=?""",
+            (date_text,)
+        )
         row = cur.fetchone()
-        if not row: con.close(); msg("Selected date not found."); return
-        (trim, heel, g1name, g1dens, g2name, g2dens, g3name, g3dens,
-         fill1, fill2, fill3, log1, log2, log3) = row
+        if not row:
+            con.close()
+            msg("Selected date not found.")
+            return
 
-        cur.execute("""SELECT group_tag, code, desc, full100_l, at_fill_l, mode, level_cm, temp_c, v_obs_l, vcf, v15_l
-                       FROM lo_rows WHERE date_text=?""", (date_text,))
+        (trim, heel, g1name, g1dens, g2name, g2dens, g3name, g3dens,
+        fill1, fill2, fill3, log1, log2, log3) = row
+
+        cur.execute(
+            """SELECT group_tag, code, desc, full100_l, at_fill_l, mode, level_cm, temp_c, v_obs_l, vcf, v15_l
+            FROM lo_rows WHERE date_text=?""",
+            (date_text,)
+        )
         rows = cur.fetchall()
         con.close()
 
+        # Header fields
         d = QDate.fromString(date_text, "yyyy-MM-dd")
-        if d.isValid(): self.deDate.setDate(d)
-        self.leTrim.setText(f"{trim:.2f}"); self.leHeel.setText(heel)
-        self.g1OilName.setText(g1name or ""); self.g1Dens.setText("" if g1dens is None else f"{g1dens}")
-        self.g2OilName.setText(g2name or ""); self.g2Dens.setText("" if g2dens is None else f"{g2dens}")
-        self.g3OilName.setText(g3name or ""); self.g3Dens.setText("" if g3dens is None else f"{g3dens}")
+        if d.isValid():
+            self.deDate.setDate(d)
+
+        self.leTrim.setText(f"{(trim or 0):.2f}")
+        self.leHeel.setText(heel or "0")  # keep token like "0.5P"/"0.5S"
+
+        self.g1OilName.setText(g1name or "")
+        self.g1Dens.setText("" if g1dens is None else f"{g1dens}")
+        self.g2OilName.setText(g2name or "")
+        self.g2Dens.setText("" if g2dens is None else f"{g2dens}")
+        self.g3OilName.setText(g3name or "")
+        self.g3Dens.setText("" if g3dens is None else f"{g3dens}")
+
         self.leFillMECirc.setText(f"{(fill1 or 0):.2f}")
         self.leFillMECyl.setText(f"{(fill2 or 0):.2f}")
         self.leFillAECirc.setText(f"{(fill3 or 0):.2f}")
-        self.leLogMECirc.setText(f"{log1 or 0}")
-        self.leLogMECyl.setText(f"{log2 or 0}")
-        self.leLogAECirc.setText(f"{log3 or 0}")
 
-        r1: List[Dict[str, Any]] = []; r2: List[Dict[str, Any]] = []; r3: List[Dict[str, Any]] = []
+        self.leLogMECirc.setText(f"{(log1 or 0):.2f}")
+        self.leLogMECyl.setText(f"{(log2 or 0):.2f}")
+        self.leLogAECirc.setText(f"{(log3 or 0):.2f}")
+
+        # Rows
+        r1: List[Dict[str, Any]] = []
+        r2: List[Dict[str, Any]] = []
+        r3: List[Dict[str, Any]] = []
         for (tag, code, desc, full100_l, at_fill_l, mode, level_cm, temp_c, v_obs_l, vcf, v15_l) in rows:
-            dct = {"code": code, "desc": desc, "full100_l": full100_l, "at_fill_l": at_fill_l,
-                   "mode": mode, "level_cm": level_cm, "temp_c": temp_c,
-                   "v_obs_l": v_obs_l, "vcf": vcf, "v15_l": v15_l}
-            if tag == "ME_CIRC": r1.append(dct)
-            elif tag == "ME_CYL": r2.append(dct)
-            elif tag == "AE_CIRC": r3.append(dct)
+            dct = {
+                "code": code, "desc": desc,
+                "full100_l": full100_l, "at_fill_l": at_fill_l,
+                "mode": mode, "level_cm": level_cm, "temp_c": temp_c,
+                "v_obs_l": v_obs_l, "vcf": vcf, "v15_l": v15_l
+            }
+            if tag == "ME_CIRC":
+                r1.append(dct)
+            elif tag == "ME_CYL":
+                r2.append(dct)
+            elif tag == "AE_CIRC":
+                r3.append(dct)
 
         self.tblMECirc.apply_rows(r1)
         self.tblMECyl.apply_rows(r2)
         self.tblAECirc.apply_rows(r3)
 
-        # refresh headers/columns and totals
+        # Refresh headers/columns and totals
         self.tblMECirc.update_fill_column(self._current_fill("me_circ"))
         self.tblMECyl.update_fill_column(self._current_fill("me_cyl"))
         self.tblAECirc.update_fill_column(self._current_fill("ae_circ"))
         self.calc_all()
+
+        info(f"Loaded LO entry for {date_text} from {DB_OPS_PATH}")
 
 # --------- main ---------
 def main():

@@ -1,6 +1,4 @@
 
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -14,16 +12,16 @@ import sqlite3
 import inspect
 
 from PySide6.QtCore import Qt, QDate, QEvent
-from PySide6.QtGui import QDoubleValidator, QFont
+from PySide6.QtGui import QDoubleValidator, QFont,QColor, QBrush, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QAbstractItemView,
     QHeaderView, QDateEdit, QFileDialog, QMessageBox, QDialog, QListWidget, QListWidgetItem,
-    QSplitter, QSizePolicy
+    QSplitter
 )
 
 # ------------------------ paths & import prep ------------------------
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]          # .../sounding_app
 APP_DIR = ROOT / "app"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -53,106 +51,15 @@ except Exception:
     spec.loader.exec_module(ops_cli)  # type: ignore
     _compute_volumes = ops_cli._compute_volumes  # type: ignore
 
-# ------------------------ ONLY call the verified CLI (with ullage support) ------------------------
-def _guess_ullage_from_db(tank_name: str, cm: float) -> Optional[float]:
-    """
-    Estimate ullage when UI only has sounding:
-    Let H ≈ max(sounding_cm + ullage_cm) for the tank, then ullage = max(0, H - cm).
-    Returns None if we can’t compute it.
-    """
-    if not CAP_DB_PATH.exists():
-        return None
-    try:
-        conn = sqlite3.connect(str(CAP_DB_PATH))
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT sounding_cm, ullage_cm
-            FROM readings
-            WHERE name=? AND sounding_cm IS NOT NULL AND ullage_cm IS NOT NULL
-        """, (tank_name,))
-        rows = cur.fetchall()
-        conn.close()
-        if not rows:
-            return None
-
-        H = None
-        for s, u in rows:
-            try:
-                s = float(s); u = float(u)
-                su = s + u
-                if H is None or su > H:
-                    H = su
-            except Exception:
-                continue
-        if H is None:
-            return None
-        ul = H - float(cm)
-        return ul if ul > 0 else 0.0
-    except Exception:
-        return None
-
-
-def compute_obs_vol_m3(cap_name: str, trim, heel_token: str, cm: float) -> float:
-    """
-    Call app.ops_cli._compute_volumes using keyword names (so arg order doesn't matter).
-    If the CLI requires 'ullage', we supply it from the DB automatically.
-    No custom math or interpolation here—this uses your tested logic only.
-    """
-    fn = _compute_volumes
-    sig = inspect.signature(fn)
-
-    kwargs = {}
-    needs_ullage = False
-
-    for pname, param in sig.parameters.items():
-        lp = pname.lower()
-        if any(k in lp for k in ("tank", "cap", "name")):
-            kwargs[pname] = cap_name
-        elif "trim" in lp:
-            kwargs[pname] = trim
-        elif "heel" in lp:
-            kwargs[pname] = heel_token  # e.g. "0", "0.5P", "0.5S"
-        elif ("ullage" in lp):
-            needs_ullage = True
-            kwargs[pname] = None  # fill after loop
-        elif ("cm" in lp) or ("sound" in lp) or ("level" in lp):
-            kwargs[pname] = cm
-        elif "metric" in lp:
-            kwargs[pname] = True  # harmless default if present
-
-    if needs_ullage:
-        for pname in sig.parameters:
-            if "ullage" in pname.lower():
-                ul = _guess_ullage_from_db(cap_name, float(cm))
-                kwargs[pname] = 0.0 if ul is None else float(ul)
-
-    result = fn(**kwargs)
-
-    # Normalize result to float
-    if isinstance(result, dict):
-        for k in ("obs_vol_m3", "volume_m3", "vol_m3", "volume"):
-            if k in result and result[k] is not None:
-                return float(result[k])
-        return 0.0
-    if isinstance(result, (int, float)):
-        return float(result)
-    if isinstance(result, (list, tuple)) and result:
-        for x in result:
-            try:
-                return float(x)
-            except Exception:
-                continue
-    return 0.0
-
-# ------------------------ constants / UI labels ------------------------
+# ------------------------ helpers ------------------------
 GREEN = "background-color:#eaffea;"
 
 # SLUDGE TANKS (go into Total Sludge)
 SLUDGE_TANKS = [
-    ("Waste Oil Tank",      "Waste Oil Tank",         0),
-    ("Sludge Tank",         "Sludge Tank",            1),
-    ("Incinerator Sludge",  "Incinerator Sludge Tank",2),
-    ("HFO Drain Tank",      "FO Drain",               3),
+    ("Waste Oil Tank",      "Waste Oil Tank",          0),
+    ("Sludge Tank",         "Sludge Tank",             1),
+    ("Incinerator Sludge",  "Incinerator Sludge Tank", 2),
+    ("HFO Drain Tank",      "FO Drain",                3),
 ]
 
 # OTHER TANKS (computed, but NOT included in Total Sludge)
@@ -175,7 +82,7 @@ def msg_warn(text: str):
     m.setText(text)
     m.exec()
 
-# ------------------------ ops.db helpers ------------------------
+# ------------------------ DB (ops.db) ------------------------
 DDL = """
 CREATE TABLE IF NOT EXISTS daily_tanks (
   id INTEGER PRIMARY KEY,
@@ -235,9 +142,12 @@ def upsert_entry(row: Dict):
     with db() as conn:
         conn.execute(sql, row)
 
-def fetch_last_n(n=10) -> List[Dict]:
+def fetch_last_n(n=30) -> List[Dict]:
     with db() as conn:
-        cur = conn.execute("SELECT * FROM daily_tanks ORDER BY ddate DESC LIMIT ?", (n,))
+        cur = conn.execute(
+            "SELECT * FROM daily_tanks ORDER BY ddate DESC LIMIT ?",
+            (n,)
+        )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -255,24 +165,136 @@ def fetch_by_date(ddate: str) -> Optional[Dict]:
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, r))
 
-# ------------------------ capacity helper ------------------------
+# ------------------------ capacity + ullage helpers (robust) ------------------------
 def get_max_capacity(tank_name: str) -> Optional[float]:
+    """
+    Returns the maximum recorded volume for a tank using whatever 'volume' column exists.
+    Tries volume_m3, then volume, then obs_vol_m3.
+    """
     if not CAP_DB_PATH.exists():
         return None
     try:
         conn = sqlite3.connect(str(CAP_DB_PATH))
-        cur = conn.execute(
-            "SELECT MAX(volume_m3) FROM readings WHERE name=?",
-            (tank_name,)
-        )
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(readings)")
+        cols = {row[1] for row in cur.fetchall()}
+        vol_col = next((c for c in ("volume_m3", "volume", "obs_vol_m3") if c in cols), None)
+        if not vol_col:
+            conn.close()
+            return None
+
+        cur.execute(f"SELECT MAX({vol_col}) FROM readings WHERE name=?", (tank_name,))
         r = cur.fetchone()
         conn.close()
-        if r and r[0] is not None:
-            return float(r[0])
+        return float(r[0]) if r and r[0] is not None else None
     except Exception as e:
         print("Capacity DB error:", e)
         return None
-    return None
+
+def _guess_ullage_from_db(tank_name: str, cm: float) -> Optional[float]:
+    """
+    Estimate ullage when UI only has sounding:
+    H ≈ max(sounding + ullage) across rows, then ullage = max(0, H - cm).
+    Detects column names flexibly.
+    """
+    if not CAP_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(CAP_DB_PATH))
+        cur = conn.cursor()
+
+        cur.execute("PRAGMA table_info(readings)")
+        all_cols = {row[1].lower(): row[1] for row in cur.fetchall()}
+
+        def pick(candidates):
+            for c in candidates:
+                if c in all_cols:
+                    return all_cols[c]
+            return None
+
+        sound_col = pick(["sounding_cm", "sounding", "sound", "level"])
+        ull_col   = pick(["ullage_cm", "ullage", "ull"])
+
+        if not sound_col or not ull_col:
+            conn.close()
+            return None
+
+        cur.execute(
+            f"""SELECT {sound_col}, {ull_col}
+                FROM readings
+                WHERE name=? AND {sound_col} IS NOT NULL AND {ull_col} IS NOT NULL""",
+            (tank_name,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return None
+
+        H = None
+        for s, u in rows:
+            try:
+                su = float(s) + float(u)
+                H = su if (H is None or su > H) else H
+            except Exception:
+                continue
+        if H is None:
+            return None
+
+        ul = H - float(cm)
+        return ul if ul > 0 else 0.0
+    except Exception:
+        return None
+
+def compute_obs_vol_m3(cap_name: str, trim, heel_token: str, cm: float) -> float:
+    """
+    Call app.ops_cli._compute_volumes using keyword names (so arg order doesn't matter).
+    If the CLI requires 'ullage', we supply it from the DB automatically.
+    """
+    fn = _compute_volumes
+    sig = inspect.signature(fn)
+
+    kwargs = {}
+    needs_ullage = False
+
+    for pname in sig.parameters:
+        lp = pname.lower()
+        if any(k in lp for k in ("tank", "cap", "name")):
+            kwargs[pname] = cap_name
+        elif "trim" in lp:
+            kwargs[pname] = trim
+        elif "heel" in lp:
+            kwargs[pname] = heel_token  # e.g., "0", "0.5P", "0.5S"
+        elif "ullage" in lp:
+            needs_ullage = True
+            kwargs[pname] = None
+        elif ("cm" in lp) or ("sound" in lp) or ("level" in lp):
+            kwargs[pname] = cm
+        elif "metric" in lp:
+            kwargs[pname] = True  # harmless default if present
+
+    if needs_ullage:
+        for pname in sig.parameters:
+            if "ullage" in pname.lower():
+                ul = _guess_ullage_from_db(cap_name, float(cm))
+                kwargs[pname] = 0.0 if ul is None else float(ul)
+
+    result = fn(**kwargs)
+
+    # Normalize to float
+    if isinstance(result, dict):
+        for k in ("obs_vol_m3", "volume_m3", "vol_m3", "volume"):
+            if k in result and result[k] is not None:
+                return float(result[k])
+        return 0.0
+    if isinstance(result, (int, float)):
+        return float(result)
+    if isinstance(result, (list, tuple)) and result:
+        for x in result:
+            try:
+                return float(x)
+            except Exception:
+                continue
+    return 0.0
 
 # ------------------------ UI ------------------------
 class DailyTanksWindow(QWidget):
@@ -319,11 +341,10 @@ class DailyTanksWindow(QWidget):
         self.leTrim.editingFinished.connect(self._recalc_volumes)
         self.leHeel.editingFinished.connect(self._recalc_volumes)
 
-        # ----- table -----
+        # ----- Today's Input table -----
         gEdit = QGroupBox("Today's Input")
         vEdit = QVBoxLayout(gEdit)
 
-        # Full header keys and display (wrapped)
         headers_full = [
             "Waste Oil Tank", "Sludge Tank", "Incinerator Sludge Tank", "HFO Drain Tank",
             "Total Sludge (m³)", "Free Space (m³)",
@@ -341,7 +362,6 @@ class DailyTanksWindow(QWidget):
 
         self.tbl = QTableWidget(3, len(headers_full))
         self.tbl.setHorizontalHeaderLabels(headers_disp)
-        # tooltips with full names
         for c, full in enumerate(headers_full):
             it = self.tbl.horizontalHeaderItem(c)
             if it:
@@ -351,27 +371,16 @@ class DailyTanksWindow(QWidget):
         self.tbl.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.tbl.setAlternatingRowColors(True)
 
-        # equal column widths + keep them equal on resize
-        self.tbl.horizontalHeader().setStretchLastSection(False)
-        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        self.tbl.viewport().installEventFilter(self)
-        self._equalize_columns(self.tbl)
-
-        # slightly tighter headers/rows (optional – looks cleaner)
-        self.tbl.horizontalHeader().setFixedHeight(40)
-        self.tbl.verticalHeader().setDefaultSectionSize(28)
-
-       
-
+        # Header styling to match
         hh = self.tbl.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setSectionResizeMode(QHeaderView.Fixed)
         hh.setMinimumSectionSize(80)
         hh.setStretchLastSection(False)
         hh_font = QFont(); hh_font.setPointSize(10); hh_font.setBold(True)
         hh.setFont(hh_font)
         hh.setFixedHeight(44)
 
-        # Column widths tuned for readability
+        # Column widths tuned for readability (feel free to tweak)
         col_widths = [110, 110, 140, 110, 95, 95, 150, 115, 125, 145, 140, 125, 125, 220]
         for i, w in enumerate(col_widths):
             self.tbl.setColumnWidth(i, w)
@@ -403,13 +412,14 @@ class DailyTanksWindow(QWidget):
         it_free_row1.setTextAlignment(Qt.AlignCenter)
         self.tbl.setItem(1, free_col, it_free_row1)
 
-        # Row 0: max capacities (sludge tanks)
+       # Row 0: max capacities (sludge tanks)
         for _label, cap_name, col in SLUDGE_TANKS:
             max_vol = get_max_capacity(cap_name)
             txt = f"{max_vol:.2f}" if max_vol is not None else "—"
             it = QTableWidgetItem(txt)
             it.setFlags(Qt.ItemIsEnabled)
             it.setTextAlignment(Qt.AlignCenter)
+            it.setForeground(QBrush(QColor("red")))
             self.tbl.setItem(0, col, it)
 
         # Row 0: max capacities (other tanks)
@@ -419,6 +429,7 @@ class DailyTanksWindow(QWidget):
             it = QTableWidgetItem(txt)
             it.setFlags(Qt.ItemIsEnabled)
             it.setTextAlignment(Qt.AlignCenter)
+            it.setForeground(QBrush(QColor("red")))
             self.tbl.setItem(0, col, it)
 
         # Row 1: sounding inputs (sludge tanks)
@@ -444,11 +455,25 @@ class DailyTanksWindow(QWidget):
             self._sound_inputs[label] = le
             le.textChanged.connect(self._recalc_volumes)
 
-        # Row 1: mirror of computed sludge totals (read-only)
-        it_total = QTableWidgetItem("—"); it_total.setFlags(Qt.ItemIsEnabled); it_total.setTextAlignment(Qt.AlignCenter)
-        it_free  = QTableWidgetItem("—"); it_free.setFlags(Qt.ItemIsEnabled);  it_free.setTextAlignment(Qt.AlignCenter)
-        self.tbl.setItem(1, 4, it_total)  # Total Sludge
-        self.tbl.setItem(1, 5, it_free)   # Free Space
+        
+            # Row 1: mirror of computed sludge totals (read-only)
+            it_total = QTableWidgetItem("—")
+            it_total.setFlags(Qt.ItemIsEnabled)
+            it_total.setTextAlignment(Qt.AlignCenter)
+            font_total = QFont()
+            font_total.setBold(True)
+            it_total.setFont(font_total)
+            it_total.setForeground(QBrush(QColor("red")))   # 🔴 Bold Red
+            self.tbl.setItem(1, 4, it_total)  # Total Sludge
+
+            it_free = QTableWidgetItem("—")
+            it_free.setFlags(Qt.ItemIsEnabled)
+            it_free.setTextAlignment(Qt.AlignCenter)
+            font_free = QFont()
+            font_free.setBold(True)
+            it_free.setFont(font_free)
+            it_free.setForeground(QBrush(QColor("blue")))   # 🔵 Bold Blue
+            self.tbl.setItem(1, 5, it_free)   # Free Space
 
         # Notes (row 1, last column)
         self.leNotes = QLineEdit("")
@@ -495,34 +520,59 @@ class DailyTanksWindow(QWidget):
         hbEdit.addWidget(self.btnClear); hbEdit.addWidget(self.btnExport)
         vEdit.addLayout(hbEdit)
 
-        # ----- history table -----
-        gHist = QGroupBox("History — last 10 entries")
+        # ----- History table -----
+        gHist = QGroupBox("History — last 30 entries")
         vHist = QVBoxLayout(gHist)
 
-        hist_headers = [
+        hist_headers_full = [
             "Date", "Trim", "Heel", "Vessel",
-            "Waste Oil (m³)", "Sludge (m³)", "Incin. Sludge (m³)", "HFO Drain (m³)",
+            "Waste Oil (m³)", "Sludge (m³)", "Incinerator Sludge (m³)", "HFO Drain (m³)",
             "Total Sludge (m³)", "Free Space (m³)",
-            "Bilge Hold (m³)", "ME Cond. (m³)", "ME L.O. (m³)",
-            "Stuff. Box (m³)", "Under Piston (m³)", "UREA Drain (m³)", "ER Coff. (m³)",
+            "Bilge Water Holding (m³)", "ME Condenser Tank (m³)", "ME L.O. Sump (m³)",
+            "Stuffing Box Drain (m³)", "Under Piston Box (m³)", "UREA Drain Tank (m³)", "ER Cofferdam (m³)",
             "Notes"
         ]
-        self.tblHist = QTableWidget(0, len(hist_headers))
-        self.tblHist.setHorizontalHeaderLabels(hist_headers)
+        hist_headers_disp = [
+            "Date", "Trim", "Heel", "Vessel",
+            "Waste Oil\n(m³)", "Sludge\n(m³)", "Incin. Sludge\n(m³)", "HFO Drain\n(m³)",
+            "Total Sludge\n(m³)", "Free Space\n(m³)",
+            "Bilge Water\nHolding (m³)", "ME Cond.\nTk (m³)", "ME L.O.\nSump (m³)",
+            "Stuff. Box\nDrain (m³)", "Under Piston\nBox (m³)", "UREA Drain\nTk (m³)", "ER\nCofferdam (m³)",
+            "Notes"
+        ]
+
+        self.tblHist = QTableWidget(0, len(hist_headers_disp))
+        self.tblHist.setHorizontalHeaderLabels(hist_headers_disp)
         self.tblHist.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tblHist.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tblHist.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.tblHist.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tblHist.verticalHeader().setVisible(False)
 
-        vHist.addWidget(self.tblHist)
-        hbHist = QHBoxLayout()
-        self.btnRetrieve = QPushButton("Retrieve…")
-        hbHist.addWidget(self.btnRetrieve)
-        hbHist.addStretch(1)
-        vHist.addLayout(hbHist)
+        hh2 = self.tblHist.horizontalHeader()
+        hh2_font = QFont(); hh2_font.setPointSize(10); hh2_font.setBold(True)
+        hh2.setFont(hh2_font)
+        hh2.setFixedHeight(44)
+        hh2.setSectionResizeMode(QHeaderView.Fixed)
 
-        # root
+        # tooltips with full names
+        for c, full in enumerate(hist_headers_full):
+            it = self.tblHist.horizontalHeaderItem(c)
+            if it:
+                it.setToolTip(full)
+
+        # Tuned widths
+        #            Date Trim Heel Vessel  W.Oil Sludge Incin HFO  Total Free Bilge ME C ME LO Stuff Under Urea  ER   Notes
+        col_w =    [  92,  65,  66,   65,   100,  100,   120, 100, 110,  110,  130, 110,  120,  120,  120, 120, 120, 180]
+        for i, w in enumerate(col_w):
+            self.tblHist.setColumnWidth(i, w)
+
+        self.tblHist.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.tblHist.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.tblHist.setWordWrap(False)
+
+        vHist.addWidget(self.tblHist)
+
+        # ----- root layout with splitter -----
         root = QVBoxLayout(self)
         root.addLayout(top)
         split = QSplitter(Qt.Vertical)
@@ -530,11 +580,7 @@ class DailyTanksWindow(QWidget):
         split.setHandleWidth(6)
         split.addWidget(gEdit)
         split.addWidget(gHist)
-
-        # Initial sizes: give the top just enough for its table + buttons (~280px),
-        # the rest goes to history. Adjust if you want even less/more.
-        split.setSizes([280, 9999])
-
+        split.setSizes([280, 9999])  # more space to history
         root.addWidget(split)
 
         # wire
@@ -543,33 +589,21 @@ class DailyTanksWindow(QWidget):
         self.btnDup.clicked.connect(self.on_duplicate)
         self.btnClear.clicked.connect(self.on_clear)
         self.btnExport.clicked.connect(self.on_export_csv)
+        self.btnRetrieve = QPushButton("Retrieve…")
+        vHist.addWidget(self.btnRetrieve)
         self.btnRetrieve.clicked.connect(self.on_retrieve)
 
         # initial compute & history
         self._recalc_volumes()
         self.refresh_history()
 
-
-    def _equalize_columns(self, table: QTableWidget):
-        cols = table.columnCount()
-        if cols <= 0:
-            return
-        usable = max(0, table.viewport().width() - 2)
-        colw = max(80, usable // cols)
-        for c in range(cols):
-            table.setColumnWidth(c, colw)
-
+    # ----- sizing helpers -----
     def _fit_input_table_height(self):
-    # Make the green table only as tall as its rows + header
+        # Make the green table only as tall as its rows + header
         hh = self.tbl.horizontalHeader().height()
         rows_h = sum(self.tbl.rowHeight(r) for r in range(self.tbl.rowCount()))
         margins = 2 * self.tbl.frameWidth()
-        self.tbl.setFixedHeight(hh + rows_h + margins + 4)
-
-    def eventFilter(self, obj, event):
-        if obj is self.tbl.viewport() and event.type() == QEvent.Resize:
-            self._equalize_columns(self.tbl)
-        return super().eventFilter(obj, event)
+        self.tbl.setFixedHeight(hh + rows_h + margins + 2)
 
     # ------------------ helpers ------------------
     @staticmethod
@@ -606,7 +640,6 @@ class DailyTanksWindow(QWidget):
         trim = self._pf(self.leTrim.text() or "0")
         heel = self._heel_token()
 
-        # compute and sum only sludge-related tanks for totals/free space
         sludge_total = 0.0
 
         # Sludge tanks (count toward total)
@@ -639,8 +672,6 @@ class DailyTanksWindow(QWidget):
         cap_item.setText(f"{TOTAL_SLUDGE_CAP:.2f}")
 
         # Row 1 mirrors:
-        #  - col 4: percentage of TOTAL_SLUDGE_CAP
-        #  - col 5: free space in m³
         pct = (sludge_total / TOTAL_SLUDGE_CAP * 100.0) if TOTAL_SLUDGE_CAP > 0 else 0.0
 
         it_total_pct = self.tbl.item(1, 4)
@@ -686,7 +717,7 @@ class DailyTanksWindow(QWidget):
             total_sludge_m3=self._pf(self.itTotalVol.text()),
             free_space_sludge_m3=self._pf(self.itFree.text()),
 
-            # other computed m³ (now taken from computed row, not inputs)
+            # other computed m³
             bilge_hold_m3=get_m3("Bilge Water Holding (m³)"),
             me_cond_m3=get_m3("ME Cond. Tk (m³)"),
             me_lo_sump_m3=get_m3("ME L.O. Sump (m³)"),
@@ -807,12 +838,11 @@ class DailyTanksWindow(QWidget):
         self._sound_inputs["Incinerator Sludge"].setText(s(data.get("incin_sludge_cm")))
         self._sound_inputs["HFO Drain Tank"].setText(s(data.get("hfo_drain_cm")))
 
-        # other tanks' cm are not stored historically; leave blank for fresh entries
         self.leNotes.setText(data.get("notes", ""))
         self._recalc_volumes()
 
     def refresh_history(self):
-        rows = fetch_last_n(10)
+        rows = fetch_last_n(30)
         self.tblHist.setRowCount(len(rows))
         for r, item in enumerate(rows):
             def fmt(x, nd=2):
@@ -840,6 +870,13 @@ class DailyTanksWindow(QWidget):
             self.tblHist.setItem(r,15, QTableWidgetItem(fmt(item.get("urea_drain_m3"))))
             self.tblHist.setItem(r,16, QTableWidgetItem(fmt(item.get("er_cofferdam_m3"))))
             self.tblHist.setItem(r,17, QTableWidgetItem(item.get("notes", "")))
+
+            # Right-align numeric columns for readability
+            numeric_cols = [1,4,5,6,7,8,9,10,11,12,13,14,15,16]
+            for c in numeric_cols:
+                it = self.tblHist.item(r, c)
+                if it:
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
 # ------------------------ main ------------------------
 def main():
